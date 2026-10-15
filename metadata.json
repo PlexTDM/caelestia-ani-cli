@@ -1,8 +1,8 @@
 {
   "id": "ani-watch",
   "name": "Ani Watch",
-  "description": "Search and watch anime from the shell using ani-cli. Toggle with: caelestia shell ipc call aniwatch toggle",
-  "version": "0.1.0",
+  "description": "Search anime, pick an episode and watch it (sub only, best quality) using ani-cli. Toggle with: caelestia shell aniwatch toggle",
+  "version": "0.2.0",
   "type": "quickshell",
   "author": "your-name",
   "license": "GPL-3.0-or-later",

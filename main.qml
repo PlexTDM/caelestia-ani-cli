@@ -1,15 +1,10 @@
-// Ani Watch - search anime, pick a show, pick an episode (sub only, best quality).
-// Requires: ani-cli (and its deps: curl, fzf, botan), mpv.
+// Ani Watch - desktop widget: search bar -> anime list -> episode grid -> play.
+// Sub only, best quality. Search/episode lists are fetched with curl using the
+// endpoint + user-agent read from your installed ani-cli; playback is ani-cli itself.
+// Requires: ani-cli and its own deps (mpv, curl, botan, fzf).
 //
-// Toggle the window with:  caelestia shell aniwatch toggle
-// (bind that command in Nexus -> Shortcuts -> add a command shortcut)
-//
-// How it works:
-//  - Search + episode lists: the same GraphQL calls ani-cli makes, via curl.
-//    The API address, referer and user-agent are read from your installed
-//    ani-cli script at startup, so they follow ani-cli updates.
-//  - Playback: handed to ani-cli (`-S <result number> -e <episode> -q best`),
-//    which handles stream resolution and launches mpv. Sub mode is forced.
+// Optional IPC (bind in Nexus -> Shortcuts):
+//   caelestia shell ipc call aniwatch toggle | show | hide
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
@@ -20,250 +15,263 @@ import QtQuick.Layouts
 Scope {
     id: root
 
-    // ---- state -----------------------------------------------------------
-    property bool open: false
-    property string view: "search"       // "search" | "episodes"
-    property string query: ""
-    property var results: []             // [{ id, name, eps, year, index }]
-    property var episodes: []            // ["1", "2", ...] ascending
-    property string playQuery: ""        // query that produced `results`
-    property string showName: ""
-    property int showIndex: 0            // 1-based position, what ani-cli -S expects
-    property string status: ""
-    property bool busy: false
-    property bool playing: false
+    // ---- tweakables -------------------------------------------------------
+    property bool shown: true
+    readonly property int widgetWidth: 380
+    readonly property int widgetHeight: 540
+    readonly property int marginTop: 80
+    readonly property int marginRight: 40
+    // The window sits on WlrLayer.Bottom (above the wallpaper, below windows).
+    // If typing in the search bar doesn't work on your setup, change it to
+    // WlrLayer.Top in the PanelWindow below.
 
-    // Filled from the installed ani-cli at startup (defaults match ani-cli 4.15).
-    property string apiUrl: "https://api.mkissa.net"
-    property string refererUrl: "https://mkissa.to"
-    property string userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0"
+    // ---- state ------------------------------------------------------------
+    property string view: "search"      // "search" | "episodes"
+    property string pendingQuery: ""
+    property var pendingPick: null
+    property var results: []            // [{id, name, eps, year, index, query}]
+    property var picked: null
+    property var episodes: []           // ["1","2",...] ascending
+    property string message: ""
+    property string playingEp: ""
+    property string lastErr: ""
+    readonly property bool loading: searchProc.running || epsProc.running
 
     readonly property string searchGql: "query( $search: SearchInput $limit: Int $page: Int $translationType: VaildTranslationTypeEnumType $countryOrigin: VaildCountryOriginEnumType ) { shows( search: $search limit: $limit page: $page translationType: $translationType countryOrigin: $countryOrigin ) { edges { _id name availableEpisodes airedStart __typename } }}"
-    readonly property string episodesGql: "query ($showId: String!) { show( _id: $showId ) { _id availableEpisodesDetail }}"
-    readonly property string cfgScript: `f=$(command -v ani-cli) || exit 1; for v in allanime_api allanime_refr agent; do grep -m1 "^$v=" "$f" | cut -d'"' -f2; done`
+    readonly property string epsGql: "query ($showId: String!) { show( _id: $showId ) { _id availableEpisodesDetail }}"
 
-    Component.onCompleted: cfgProc.running = true
+    // POSTs $1 as JSON to the API ani-cli is configured with.
+    readonly property string apiScript: `
+f=$(command -v ani-cli) || { echo '{"error":"ani-cli not found"}'; exit 0; }
+api=$(grep -m1 '^allanime_api=' "$f" | cut -d'"' -f2)
+refr=$(grep -m1 '^allanime_refr=' "$f" | cut -d'"' -f2)
+agent=$(grep -m1 '^agent=' "$f" | cut -d'"' -f2)
+[ -n "$api" ] || api=https://api.mkissa.net
+[ -n "$refr" ] || refr=https://mkissa.to
+exec curl -s --max-time 20 -e "$refr" -A "$agent" -H 'Content-Type: application/json' -X POST "$api/api" --data "$1"
+`
 
-    // ---- helpers ---------------------------------------------------------
-    function curlPost(body) {
-        return ["curl", "-s", "-m", "20",
-                "-e", root.refererUrl, "-A", root.userAgent,
-                "-H", "Content-Type: application/json",
-                "-X", "POST", root.apiUrl + "/api",
-                "--data", JSON.stringify(body)];
-    }
-
-    function startSearch() {
-        const q = root.query.trim();
+    // ---- search -----------------------------------------------------------
+    function startSearch(text) {
+        // Same normalisation ani-cli applies to its query argument.
+        const q = text.replace(/["\\]/g, "").trim().replace(/^-+/, "").replace(/\s+/g, "+");
         if (q === "") {
             root.results = [];
-            root.status = "";
-            root.busy = false;
+            root.message = "";
             return;
         }
-        if (searchProc.running)
-            return;   // onExited re-checks the query and restarts if it changed
-        searchProc.sentQuery = q;
-        // ani-cli turns spaces into "+" before searching; do the same so the
-        // result order (and therefore the -S index) matches.
-        searchProc.command = root.curlPost({
+        if (searchProc.running) {
+            root.pendingQuery = q;
+            return;
+        }
+        runSearch(q);
+    }
+
+    function runSearch(q) {
+        root.pendingQuery = "";
+        root.message = "";
+        searchProc.q = q;
+        const body = JSON.stringify({
             variables: {
-                search: { allowAdult: false, allowUnknown: false, query: q.replace(/\s+/g, "+") },
-                limit: 40,
-                page: 1,
-                translationType: "sub",
-                countryOrigin: "ALL"
+                search: { allowAdult: false, allowUnknown: false, query: q },
+                limit: 40, page: 1, translationType: "sub", countryOrigin: "ALL"
             },
             query: root.searchGql
         });
-        root.busy = true;
-        root.status = "Searching...";
+        searchProc.command = ["sh", "-c", root.apiScript, "aa", body];
         searchProc.running = true;
     }
 
-    function parseResults(text, q) {
+    function onSearchDone(text, q) {
+        let j;
         try {
-            const edges = JSON.parse(text).data.shows.edges;
-            const out = [];
-            for (const e of edges) {
-                const eps = e.availableEpisodes ? Number(e.availableEpisodes.sub) : 0;
-                if (!(eps >= 1))
-                    continue;   // sub only: skip shows with no sub episodes (same filter as ani-cli)
-                out.push({
-                    id: e._id,
-                    name: e.name,
-                    eps: eps,
-                    year: (e.airedStart && e.airedStart.year) ? e.airedStart.year : 0,
-                    index: out.length + 1
-                });
-            }
-            root.results = out;
-            root.playQuery = q;
-            root.status = out.length === 0 ? "No sub results" : "";
-        } catch (err) {
-            root.status = "Unexpected API response - try updating ani-cli (ani-cli -U)";
+            j = JSON.parse(text);
+        } catch (e) {
+            root.results = [];
+            root.message = "Search failed (no response)";
+            return;
         }
+        if (j.error) {
+            root.results = [];
+            root.message = j.error;
+            return;
+        }
+        const edges = (j.data && j.data.shows && j.data.shows.edges) || [];
+        // Mirror ani-cli's own filtering so "-S <n>" lands on the same show:
+        // it keeps only shows with >=1 sub episode and a usable airedStart.
+        const kept = edges.filter(e => {
+            const ok = e.availableEpisodes && e.availableEpisodes.sub > 0;
+            const a = e.airedStart;
+            const dated = a && typeof a === "object" && (Object.keys(a).length === 0 || typeof a.year === "number");
+            return ok && dated;
+        });
+        root.results = kept.map((e, i) => ({
+            id: e._id,
+            name: e.name,
+            eps: e.availableEpisodes.sub,
+            year: (e.airedStart && e.airedStart.year) || 0,
+            index: i + 1,
+            query: q
+        }));
+        if (root.results.length === 0)
+            root.message = "No results";
     }
 
-    function pickShow(item) {
-        if (episodesProc.running)
-            return;
-        root.showName = item.name;
-        root.showIndex = item.index;
+    // ---- episodes ---------------------------------------------------------
+    function openAnime(r) {
+        root.picked = r;
         root.episodes = [];
         root.view = "episodes";
-        root.busy = true;
-        root.status = "Loading episodes...";
-        episodesProc.command = root.curlPost({ variables: { showId: item.id }, query: root.episodesGql });
-        episodesProc.running = true;
-    }
-
-    function parseEpisodes(text) {
-        try {
-            const detail = JSON.parse(text).data.show.availableEpisodesDetail;
-            const list = (detail.sub || []).slice();
-            list.sort((a, b) => parseFloat(a) - parseFloat(b));
-            root.episodes = list;
-            root.status = list.length === 0 ? "No sub episodes found" : "";
-        } catch (err) {
-            root.status = "Unexpected API response - try updating ani-cli (ani-cli -U)";
-        }
-    }
-
-    function play(ep) {
-        if (playProc.running) {
-            root.status = "Something is already playing - close mpv first";
+        root.message = "";
+        if (epsProc.running) {
+            root.pendingPick = r;
             return;
         }
-        // `env` sets sub mode, best quality and a TERM so ani-cli's tput calls stay quiet.
-        // --exit-after-play skips ani-cli's interactive "next/replay" menu.
-        playProc.command = ["env", "ANI_CLI_MODE=sub", "ANI_CLI_QUALITY=best", "TERM=xterm",
-                            "ani-cli", "--exit-after-play",
-                            "-S", String(root.showIndex),
-                            "-e", String(ep),
-                            "-q", "best",
-                            root.playQuery];
-        root.playing = true;
-        root.status = "Starting episode " + ep + "...";
+        runEpisodes(r);
+    }
+
+    function runEpisodes(r) {
+        root.pendingPick = null;
+        epsProc.showId = r.id;
+        const body = JSON.stringify({ variables: { showId: r.id }, query: root.epsGql });
+        epsProc.command = ["sh", "-c", root.apiScript, "aa", body];
+        epsProc.running = true;
+    }
+
+    function onEpsDone(text, showId) {
+        if (!root.picked || root.picked.id !== showId)
+            return;
+        let j;
+        try {
+            j = JSON.parse(text);
+        } catch (e) {
+            root.message = "Couldn't load episodes";
+            return;
+        }
+        const d = j.data && j.data.show && j.data.show.availableEpisodesDetail;
+        const list = (d && d.sub) ? d.sub.slice() : [];
+        list.sort((a, b) => parseFloat(a) - parseFloat(b));
+        root.episodes = list;
+        if (list.length === 0)
+            root.message = "No sub episodes";
+    }
+
+    // ---- playback (ani-cli, sub, best quality) ----------------------------
+    function play(ep) {
+        if (playProc.running || !root.picked)
+            return;
+        root.message = "";
+        root.lastErr = "";
+        root.playingEp = ep;
+        playProc.command = [
+            "env", "ANI_CLI_MODE=sub", "TERM=xterm",
+            "ani-cli", "--exit-after-play",
+            "-S", String(root.picked.index),
+            "-e", ep,
+            "-q", "best",
+            root.picked.query
+        ];
         playProc.running = true;
     }
 
-    function back() {
-        root.view = "search";
-        root.status = "";
-    }
-
-    // ---- processes -------------------------------------------------------
-    Process {
-        id: cfgProc
-
-        command: ["sh", "-c", root.cfgScript]
-        stdout: StdioCollector { id: cfgOut }
-
-        onExited: (code) => {
-            if (code !== 0) {
-                root.status = "ani-cli not found in the shell's PATH";
-                return;
-            }
-            const l = cfgOut.text.split("\n");
-            if (l[0]) root.apiUrl = l[0];
-            if (l[1]) root.refererUrl = l[1];
-            if (l[2]) root.userAgent = l[2];
-        }
+    function clean(line) {
+        return line.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\r/g, "").trim();
     }
 
     Process {
         id: searchProc
 
-        property string sentQuery: ""
+        property string q: ""
 
-        stdout: StdioCollector { id: searchOut }
+        stdout: StdioCollector {
+            id: searchOut
+        }
 
-        onExited: (code) => {
-            root.busy = false;
-            if (root.query.trim() !== searchProc.sentQuery) {
-                root.startSearch();   // query changed while we were waiting
-                return;
-            }
-            if (code !== 0) {
-                root.status = "Couldn't reach the anime API (curl exit " + code + ")";
-                return;
-            }
-            root.parseResults(searchOut.text, searchProc.sentQuery);
+        onExited: {
+            root.onSearchDone(searchOut.text, searchProc.q);
+            if (root.pendingQuery !== "")
+                root.runSearch(root.pendingQuery);
         }
     }
 
     Process {
-        id: episodesProc
+        id: epsProc
 
-        stdout: StdioCollector { id: episodesOut }
+        property string showId: ""
 
-        onExited: (code) => {
-            root.busy = false;
-            if (code !== 0) {
-                root.status = "Couldn't load episodes (curl exit " + code + ")";
-                return;
-            }
-            root.parseEpisodes(episodesOut.text);
+        stdout: StdioCollector {
+            id: epsOut
+        }
+
+        onExited: {
+            root.onEpsDone(epsOut.text, epsProc.showId);
+            if (root.pendingPick)
+                root.runEpisodes(root.pendingPick);
         }
     }
 
     Process {
         id: playProc
 
-        stderr: StdioCollector { id: playErr }
-
-        onExited: (code) => {
-            root.playing = false;
-            if (code === 0) {
-                root.status = "";
-                return;
-            }
-            const lines = playErr.text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").split("\n")
-                .map(s => s.trim()).filter(s => s !== "");
-            root.status = lines.length > 0 ? lines[lines.length - 1] : "ani-cli exited with code " + code;
+        // mpv runs in the foreground here; drop its output line by line.
+        stdout: SplitParser {
+            onRead: line => {}
         }
-    }
+        stderr: SplitParser {
+            onRead: line => {
+                const c = root.clean(line);
+                if (c !== "")
+                    root.lastErr = c;
+            }
+        }
 
-    Timer {
-        id: debounce
-
-        interval: 450
-        onTriggered: root.startSearch()
+        onExited: code => {
+            root.playingEp = "";
+            root.message = code === 0 ? "" : (root.lastErr || ("ani-cli exited with code " + code));
+        }
     }
 
     IpcHandler {
         target: "aniwatch"
 
         function toggle(): void {
-            root.open = !root.open;
+            root.shown = !root.shown;
         }
 
         function show(): void {
-            root.open = true;
+            root.shown = true;
         }
 
         function hide(): void {
-            root.open = false;
+            root.shown = false;
         }
     }
 
-    // ---- UI --------------------------------------------------------------
+    // ---- UI ---------------------------------------------------------------
     LazyLoader {
-        active: root.open
+        active: root.shown
 
         PanelWindow {
-            implicitWidth: 560
-            implicitHeight: 560
+            anchors {
+                top: true
+                right: true
+            }
+            margins {
+                top: root.marginTop
+                right: root.marginRight
+            }
+            implicitWidth: root.widgetWidth
+            implicitHeight: root.widgetHeight
             color: "transparent"
             exclusionMode: ExclusionMode.Ignore
-            WlrLayershell.layer: WlrLayer.Overlay
+            WlrLayershell.namespace: "aniwatch"
+            WlrLayershell.layer: WlrLayer.Bottom
             WlrLayershell.keyboardFocus: WlrKeyboardFocus.OnDemand
 
             Rectangle {
                 anchors.fill: parent
-                radius: 16
-                color: "#1e2327"
+                radius: 18
+                color: Qt.rgba(0.12, 0.137, 0.153, 0.94)
                 border.color: "#3a444b"
                 border.width: 1
 
@@ -272,90 +280,106 @@ Scope {
                     anchors.margins: 14
                     spacing: 10
 
-                    // single search bar
+                    TextField {
+                        id: search
+
+                        Layout.fillWidth: true
+                        placeholderText: "Search anime..."
+                        placeholderTextColor: "#8a949b"
+                        color: "#e0e0e0"
+                        font.pixelSize: 15
+                        selectByMouse: true
+                        leftPadding: 14
+                        background: Rectangle {
+                            radius: 12
+                            color: "#2a3238"
+                            border.color: search.activeFocus ? "#8ab4f8" : "transparent"
+                            border.width: 1
+                        }
+                        onTextEdited: {
+                            root.view = "search";
+                            debounce.restart();
+                        }
+                        onAccepted: {
+                            debounce.stop();
+                            root.view = "search";
+                            root.startSearch(search.text);
+                        }
+
+                        Timer {
+                            id: debounce
+
+                            interval: 450
+                            onTriggered: root.startSearch(search.text)
+                        }
+                    }
+
+                    // Episode view header
                     RowLayout {
                         Layout.fillWidth: true
+                        visible: root.view === "episodes" && root.picked !== null
                         spacing: 8
 
-                        Button {
-                            visible: root.view === "episodes"
-                            text: "\u2190"
-                            onClicked: root.back()
+                        Rectangle {
+                            Layout.preferredWidth: 32
+                            Layout.preferredHeight: 32
+                            radius: 16
+                            color: backArea.containsMouse ? "#3a444b" : "#2a3238"
+
+                            Text {
+                                anchors.centerIn: parent
+                                text: "←"
+                                color: "#e0e0e0"
+                                font.pixelSize: 16
+                            }
+
+                            MouseArea {
+                                id: backArea
+
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                onClicked: root.view = "search"
+                            }
                         }
 
-                        TextField {
-                            id: search
-
+                        Text {
                             Layout.fillWidth: true
-                            text: root.query
-                            placeholderText: "Search anime..."
+                            text: root.picked ? root.picked.name : ""
                             color: "#e0e0e0"
-                            placeholderTextColor: "#8a949b"
-                            font.pixelSize: 15
-                            leftPadding: 12
-                            background: Rectangle {
-                                radius: 10
-                                color: "#2a3035"
-                            }
-                            Component.onCompleted: forceActiveFocus()
-                            onTextEdited: {
-                                root.query = text;
-                                root.view = "search";
-                                debounce.restart();
-                            }
-                            onAccepted: {
-                                debounce.stop();
-                                root.startSearch();
-                            }
-                            Keys.onEscapePressed: {
-                                if (root.view === "episodes")
-                                    root.back();
-                                else
-                                    root.open = false;
-                            }
+                            font.pixelSize: 14
+                            font.bold: true
+                            elide: Text.ElideRight
                         }
 
-                        Button {
-                            text: "\u2715"
-                            onClicked: root.open = false
+                        Text {
+                            text: root.episodes.length > 0 ? root.episodes.length + " eps · sub" : ""
+                            color: "#8a949b"
+                            font.pixelSize: 12
                         }
                     }
 
-                    Text {
-                        Layout.fillWidth: true
-                        visible: root.status !== ""
-                        text: root.status
-                        color: root.busy || root.playing ? "#9fb4c0" : "#f2b8b5"
-                        font.pixelSize: 12
-                        elide: Text.ElideRight
-                    }
-
-                    // step 1: results
+                    // Results list
                     ListView {
-                        id: resultList
-
                         Layout.fillWidth: true
                         Layout.fillHeight: true
                         visible: root.view === "search"
                         clip: true
                         spacing: 6
                         model: root.results
-                        boundsBehavior: Flickable.StopAtBounds
-                        ScrollBar.vertical: ScrollBar {}
 
                         delegate: Rectangle {
                             required property var modelData
 
-                            width: resultList.width
+                            width: ListView.view.width
                             height: 54
-                            radius: 10
-                            color: rowMouse.containsMouse ? "#323b42" : "#2a3035"
+                            radius: 12
+                            color: resArea.containsMouse ? "#37434b" : "#2a3238"
 
                             Column {
                                 anchors.verticalCenter: parent.verticalCenter
                                 anchors.left: parent.left
-                                anchors.leftMargin: 12
-                                width: parent.width - 24
+                                anchors.right: parent.right
+                                anchors.margins: 12
                                 spacing: 2
 
                                 Text {
@@ -367,100 +391,75 @@ Scope {
                                 }
 
                                 Text {
-                                    text: modelData.eps + " sub episodes" + (modelData.year ? "  \u00b7  " + modelData.year : "")
+                                    text: modelData.eps + " episodes" + (modelData.year > 0 ? " · " + modelData.year : "")
                                     color: "#8a949b"
                                     font.pixelSize: 11
                                 }
                             }
 
                             MouseArea {
-                                id: rowMouse
+                                id: resArea
 
                                 anchors.fill: parent
                                 hoverEnabled: true
-                                onClicked: root.pickShow(modelData)
+                                onClicked: root.openAnime(modelData)
                             }
                         }
                     }
 
-                    // step 2: episodes
-                    ColumnLayout {
+                    // Episode grid
+                    GridView {
+                        id: grid
+
                         Layout.fillWidth: true
                         Layout.fillHeight: true
                         visible: root.view === "episodes"
-                        spacing: 8
+                        clip: true
+                        cellWidth: Math.floor(width / 6)
+                        cellHeight: 44
+                        model: root.episodes
 
-                        Text {
-                            Layout.fillWidth: true
-                            text: root.showName
-                            color: "#e0e0e0"
-                            font.pixelSize: 16
-                            font.bold: true
-                            elide: Text.ElideRight
-                        }
+                        delegate: Item {
+                            required property var modelData
 
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 10
+                            width: grid.cellWidth
+                            height: grid.cellHeight
 
-                            Text {
-                                text: "Sub \u00b7 best quality"
-                                color: "#8a949b"
-                                font.pixelSize: 12
-                            }
+                            Rectangle {
+                                anchors.fill: parent
+                                anchors.margins: 3
+                                radius: 8
+                                color: modelData === root.playingEp ? "#4f7cff" : (epArea.containsMouse ? "#37434b" : "#2a3238")
 
-                            Item {
-                                Layout.fillWidth: true
-                            }
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: modelData
+                                    color: "#e0e0e0"
+                                    font.pixelSize: 13
+                                }
 
-                            Button {
-                                visible: root.episodes.length > 0
-                                text: "Play latest (ep " + root.episodes[root.episodes.length - 1] + ")"
-                                onClicked: root.play(root.episodes[root.episodes.length - 1])
-                            }
-                        }
+                                MouseArea {
+                                    id: epArea
 
-                        GridView {
-                            id: epGrid
-
-                            Layout.fillWidth: true
-                            Layout.fillHeight: true
-                            clip: true
-                            cellWidth: 70
-                            cellHeight: 46
-                            model: root.episodes
-                            boundsBehavior: Flickable.StopAtBounds
-                            ScrollBar.vertical: ScrollBar {}
-
-                            delegate: Item {
-                                required property var modelData
-
-                                width: epGrid.cellWidth
-                                height: epGrid.cellHeight
-
-                                Rectangle {
                                     anchors.fill: parent
-                                    anchors.margins: 3
-                                    radius: 8
-                                    color: epMouse.containsMouse ? "#3d6a8a" : "#2a3035"
-
-                                    Text {
-                                        anchors.centerIn: parent
-                                        text: modelData
-                                        color: "#e0e0e0"
-                                        font.pixelSize: 14
-                                    }
-
-                                    MouseArea {
-                                        id: epMouse
-
-                                        anchors.fill: parent
-                                        hoverEnabled: true
-                                        onClicked: root.play(modelData)
-                                    }
+                                    hoverEnabled: true
+                                    onClicked: root.play(modelData)
                                 }
                             }
                         }
+                    }
+
+                    // Status line
+                    Text {
+                        Layout.fillWidth: true
+                        text: root.playingEp !== "" ? "Playing episode " + root.playingEp + "…"
+                            : root.loading ? "Loading…"
+                            : root.message !== "" ? root.message
+                            : (root.view === "search" && root.results.length === 0 ? "Type a name and press Enter" : "")
+                        color: root.playingEp !== "" || root.loading ? "#8ab4f8" : (root.message !== "" ? "#f2b8b5" : "#8a949b")
+                        font.pixelSize: 12
+                        elide: Text.ElideRight
+                        visible: text !== ""
                     }
                 }
             }
